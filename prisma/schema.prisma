@@ -1,0 +1,126 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum SessionStatus {
+  active
+  abandoned
+  recovered
+}
+
+enum InterventionChannel {
+  email
+  sms
+  push
+  in_app
+  none
+}
+
+enum InterventionStatus {
+  sent
+  opened
+  clicked
+  converted
+  control
+  blocked
+}
+
+model Session {
+  sessionId     String        @id @map("session_id")
+  customerId    String        @map("customer_id")
+  device        String?
+  geo           String?
+  trafficSource String?       @map("traffic_source")
+  startTime     DateTime      @map("start_time")
+  lastActivity  DateTime?     @map("last_activity")
+  status        SessionStatus @default(active)
+  clv           Float         @default(0)
+
+  cart          Cart?
+  contexts      AbandonmentContext[]
+  interventions Intervention[]
+
+  @@index([customerId])
+  @@index([status])
+  @@map("sessions")
+}
+
+model Cart {
+  cartId      String    @id @map("cart_id")
+  sessionId   String    @unique @map("session_id")
+  items       Json
+  totalValue  Float     @map("total_value")
+  categories  Json
+  createdAt   DateTime  @default(now()) @map("created_at")
+  abandonedAt DateTime? @map("abandoned_at")
+
+  session Session @relation(fields: [sessionId], references: [sessionId], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@map("carts")
+}
+
+model AbandonmentContext {
+  contextId        String   @id @map("context_id")
+  sessionId        String   @map("session_id")
+  lastAction       String?  @map("last_action")
+  timeAtCheckout   DateTime @map("time_at_checkout")
+  paymentErrorCode String?  @map("payment_error_code")
+  rootCauseNotes   String?  @map("root_cause_notes")
+
+  session Session @relation(fields: [sessionId], references: [sessionId], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@index([timeAtCheckout])
+  @@map("abandonment_contexts")
+}
+
+model Intervention {
+  interventionId String              @id @map("intervention_id")
+  sessionId      String              @map("session_id")
+  customerId     String              @map("customer_id")
+  channel        InterventionChannel
+  offerType      String              @map("offer_type")
+  discountDepth  Float               @map("discount_depth")
+  sentAt         DateTime            @map("sent_at")
+  status         InterventionStatus
+  isControlGroup Boolean             @default(false) @map("is_control_group")
+  convertedValue Float               @default(0) @map("converted_value")
+
+  session Session @relation(fields: [sessionId], references: [sessionId], onDelete: Cascade)
+
+  @@index([customerId])
+  @@index([sessionId])
+  @@index([sentAt])
+  @@index([channel])
+  @@map("interventions")
+}
+
+model AuditLog {
+  logId             String   @id @map("log_id")
+  timestamp         DateTime @default(now())
+  eventType         String   @map("event_type")
+  payload           Json
+  complianceChecked Boolean  @map("compliance_checked")
+
+  @@index([timestamp])
+  @@index([eventType])
+  @@map("audit_logs")
+}
+
+model ChannelStats {
+  channel     InterventionChannel @id
+  alpha       Float               @default(1)
+  beta        Float               @default(1)
+  attempts    Int                 @default(0)
+  conversions Int                 @default(0)
+  revenue     Float               @default(0)
+  updatedAt   DateTime            @updatedAt @map("updated_at")
+
+  @@map("channel_stats")
+}

@@ -15,16 +15,13 @@ async function createSession(data) {
             customerId: data.customerId,
 
             device:
-                data.device ||
-                "Unknown",
+                data.device || "Unknown",
 
             geo:
-                data.geo ||
-                "Unknown",
+                data.geo || "Unknown",
 
             trafficSource:
-                data.trafficSource ||
-                "Direct",
+                data.trafficSource || "Direct",
 
             startTime:
                 data.startTime
@@ -63,7 +60,6 @@ async function updateSession(
         where: {
             sessionId
         },
-
         data
     });
 }
@@ -123,7 +119,6 @@ async function updateCart(
         where: {
             sessionId
         },
-
         data
     });
 }
@@ -147,8 +142,7 @@ async function createContext(data) {
                 data.sessionId,
 
             lastAction:
-                data.lastAction ||
-                null,
+                data.lastAction || null,
 
             timeAtCheckout:
                 data.timeAtCheckout
@@ -180,8 +174,7 @@ async function getLatestContext(
         },
 
         orderBy: {
-            timeAtCheckout:
-                "desc"
+            timeAtCheckout: "desc"
         }
     });
 }
@@ -198,7 +191,6 @@ async function createIntervention(
 ) {
 
     return await prisma.intervention.create({
-
         data: {
 
             interventionId:
@@ -222,11 +214,12 @@ async function createIntervention(
                 ),
 
             sentAt:
-                new Date(),
+                data.sentAt
+                    ? new Date(data.sentAt)
+                    : new Date(),
 
             status:
-                data.status ||
-                "sent",
+                data.status || "sent",
 
             isControlGroup:
                 Boolean(
@@ -250,6 +243,29 @@ async function getIntervention(
 
         where: {
             interventionId
+        }
+    });
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| GET LATEST INTERVENTION
+|--------------------------------------------------------------------------
+*/
+
+async function getLatestIntervention(
+    sessionId
+) {
+
+    return await prisma.intervention.findFirst({
+
+        where: {
+            sessionId: sessionId
+        },
+
+        orderBy: {
+            sentAt: "desc"
         }
     });
 }
@@ -282,8 +298,7 @@ async function getCustomerInterventions(
         },
 
         orderBy: {
-            sentAt:
-                "desc"
+            sentAt: "desc"
         }
     });
 }
@@ -294,73 +309,153 @@ async function getCustomerInterventions(
 | RECORD CONVERSION
 |--------------------------------------------------------------------------
 |
-| This function:
+| Supports:
 |
-| 1. Finds the latest intervention for the session
-| 2. Marks it as converted
-| 3. Stores conversion revenue
-| 4. Marks the session as recovered
-| 5. Updates Thompson Sampling
+| recordConversion(sessionId, conversionValue)
+|
+| OR:
+|
+| recordConversion(interventionObject, conversionValue)
 |
 |--------------------------------------------------------------------------
 */
 
 async function recordConversion(
-    sessionId,
+    interventionOrSession,
     conversionValue
 ) {
 
-    const value =
-        Number(
-            conversionValue || 0
-        );
+    let intervention = null;
 
 
-    if (value < 0) {
+    /*
+    |--------------------------------------------------------------------------
+    | CASE 1: Intervention object
+    |--------------------------------------------------------------------------
+    */
 
-        throw new Error(
-            "Conversion value cannot be negative"
-        );
+    if (
+        typeof interventionOrSession === "object" &&
+        interventionOrSession !== null
+    ) {
+
+        if (
+            interventionOrSession.interventionId
+        ) {
+
+            intervention =
+                await prisma.intervention.findUnique({
+
+                    where: {
+                        interventionId:
+                            interventionOrSession.interventionId
+                    }
+                });
+        }
     }
 
 
     /*
     |--------------------------------------------------------------------------
-    | Find latest intervention
+    | CASE 2: Session ID
     |--------------------------------------------------------------------------
     */
 
-    const intervention =
-        await prisma.intervention.findFirst({
+    else if (
+        typeof interventionOrSession === "string"
+    ) {
 
-            where: {
-                sessionId
-            },
+        intervention =
+            await getLatestIntervention(
+                interventionOrSession
+            );
+    }
 
-            orderBy: {
-                sentAt:
-                    "desc"
-            }
-        });
 
+    /*
+    |--------------------------------------------------------------------------
+    | Validate intervention
+    |--------------------------------------------------------------------------
+    */
 
     if (!intervention) {
 
         throw new Error(
-            "No intervention found for this session"
+            "No intervention found for conversion"
         );
     }
 
 
     /*
     |--------------------------------------------------------------------------
-    | Control group
+    | Conversion value
     |--------------------------------------------------------------------------
-    |
-    | Control users do not receive an intervention,
-    | but if a conversion is simulated against a
-    | control record, we still record the conversion.
-    |
+    */
+
+    let value;
+
+
+    if (
+        conversionValue !== undefined &&
+        conversionValue !== null
+    ) {
+
+        value =
+            Number(conversionValue);
+
+    } else if (
+        intervention.convertedValue !== undefined &&
+        intervention.convertedValue !== null
+    ) {
+
+        value =
+            Number(
+                intervention.convertedValue
+            );
+
+    } else {
+
+        value = 0;
+    }
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | Validate conversion value
+    |--------------------------------------------------------------------------
+    */
+
+    if (
+        !Number.isFinite(value) ||
+        value < 0
+    ) {
+
+        throw new Error(
+            "Invalid conversion value"
+        );
+    }
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | Prevent duplicate conversion
+    |--------------------------------------------------------------------------
+    */
+
+    if (
+        intervention.status ===
+        "converted"
+    ) {
+
+        throw new Error(
+            "Intervention has already been converted"
+        );
+    }
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | Update intervention
     |--------------------------------------------------------------------------
     */
 
@@ -386,15 +481,17 @@ async function recordConversion(
 
     /*
     |--------------------------------------------------------------------------
-    | Mark session as recovered
+    | Update session
     |--------------------------------------------------------------------------
     */
 
-    const updatedSession =
+    const session =
         await prisma.session.update({
 
             where: {
-                sessionId
+
+                sessionId:
+                    intervention.sessionId
             },
 
             data: {
@@ -410,129 +507,19 @@ async function recordConversion(
 
     /*
     |--------------------------------------------------------------------------
-    | Thompson Sampling Learning
-    |--------------------------------------------------------------------------
-    |
-    | IMPORTANT:
-    |
-    | updateChannelReward() expects:
-    |
-    |     channel
-    |     conversion
-    |     revenue
-    |
-    | Do NOT pass the entire intervention object.
-    |
-    |--------------------------------------------------------------------------
-    */
-
-    let learning = null;
-
-
-    try {
-
-        const {
-            updateChannelReward
-        } = require(
-            "../engines/thompsonSampling"
-        );
-
-
-        /*
-        |--------------------------------------------------------------------------
-        | Control groups have channel = "none".
-        |
-        | "none" is intentionally not sent to Thompson Sampling
-        | because Thompson Sampling only learns from actual
-        | recovery channels.
-        |--------------------------------------------------------------------------
-        */
-
-        if (
-            intervention.channel &&
-            intervention.channel !== "none"
-        ) {
-
-            learning =
-                await updateChannelReward(
-
-                    intervention.channel,
-
-                    true,
-
-                    value
-                );
-
-        } else {
-
-            learning = {
-
-                skipped:
-                    true,
-
-                reason:
-                    "Control group conversion; no recovery channel to learn from"
-            };
-        }
-
-
-    } catch (error) {
-
-        /*
-        |--------------------------------------------------------------------------
-        | Learning failure should not undo a successful conversion.
-        |--------------------------------------------------------------------------
-        */
-
-        console.error(
-            "Learning update failed:",
-            error.message
-        );
-
-
-        learning = {
-
-            skipped:
-                true,
-
-            error:
-                error.message
-        };
-    }
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Return conversion result
+    | Return result
     |--------------------------------------------------------------------------
     */
 
     return {
 
-        sessionId,
+        intervention:
+            updatedIntervention,
 
-        interventionId:
-            updatedIntervention.interventionId,
-
-        customerId:
-            updatedIntervention.customerId,
-
-        conversionValue:
-            updatedIntervention.convertedValue,
+        session,
 
         recoveredRevenue:
-            value,
-
-        controlGroup:
-            updatedIntervention.isControlGroup,
-
-        channel:
-            updatedIntervention.channel,
-
-        sessionStatus:
-            updatedSession.status,
-
-        learning
+            value
     };
 }
 
@@ -577,40 +564,25 @@ async function getAuditLogs() {
     return await prisma.auditLog.findMany({
 
         orderBy: {
-
-            timestamp:
-                "desc"
+            timestamp: "desc"
         },
 
-        take:
-            500
+        take: 500
     });
 }
 
 
 /*
 |--------------------------------------------------------------------------
-| ANALYTICS METRICS
+| GENERAL ANALYTICS
 |--------------------------------------------------------------------------
 */
 
 async function getMetrics() {
 
-    /*
-    |--------------------------------------------------------------------------
-    | Sessions
-    |--------------------------------------------------------------------------
-    */
-
     const totalSessions =
         await prisma.session.count();
 
-
-    /*
-    |--------------------------------------------------------------------------
-    | Abandoned sessions
-    |--------------------------------------------------------------------------
-    */
 
     const abandonedSessions =
         await prisma.session.count({
@@ -628,12 +600,6 @@ async function getMetrics() {
         });
 
 
-    /*
-    |--------------------------------------------------------------------------
-    | Recovered sessions
-    |--------------------------------------------------------------------------
-    */
-
     const recoveredSessions =
         await prisma.session.count({
 
@@ -645,45 +611,31 @@ async function getMetrics() {
         });
 
 
-    /*
-    |--------------------------------------------------------------------------
-    | All interventions
-    |--------------------------------------------------------------------------
-    */
-
-    const interventions =
-        await prisma.intervention.findMany();
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Treatment / Control
-    |--------------------------------------------------------------------------
-    */
-
     const treatment =
-        interventions.filter(
-            (item) =>
-                !item.isControlGroup
-        );
+        await prisma.intervention.findMany({
+
+            where: {
+
+                isControlGroup:
+                    false
+            }
+        });
 
 
     const control =
-        interventions.filter(
-            (item) =>
-                item.isControlGroup
-        );
+        await prisma.intervention.findMany({
 
+            where: {
 
-    /*
-    |--------------------------------------------------------------------------
-    | Conversions
-    |--------------------------------------------------------------------------
-    */
+                isControlGroup:
+                    true
+            }
+        });
+
 
     const treatmentConversions =
         treatment.filter(
-            (item) =>
+            item =>
                 item.status ===
                 "converted"
         );
@@ -691,9 +643,294 @@ async function getMetrics() {
 
     const controlConversions =
         control.filter(
-            (item) =>
+            item =>
                 item.status ===
                 "converted"
+        );
+
+
+    const treatmentRate =
+        treatment.length > 0
+            ? (
+                treatmentConversions.length /
+                treatment.length
+            ) * 100
+            : 0;
+
+
+    const controlRate =
+        control.length > 0
+            ? (
+                controlConversions.length /
+                control.length
+            ) * 100
+            : 0;
+
+
+    const totalRevenue =
+        treatment.reduce(
+
+            (
+                total,
+                item
+            ) =>
+                total +
+                Number(
+                    item.convertedValue ||
+                    0
+                ),
+
+            0
+        );
+
+
+    const incrementalRate =
+        Math.max(
+            0,
+            treatmentRate -
+            controlRate
+        );
+
+
+    const incrementalRevenue =
+        totalRevenue *
+        (
+            incrementalRate /
+            100
+        );
+
+
+    const averageDiscount =
+        treatment.length > 0
+            ? (
+                treatment.reduce(
+
+                    (
+                        total,
+                        item
+                    ) =>
+                        total +
+                        Number(
+                            item.discountDepth ||
+                            0
+                        ),
+
+                    0
+                ) /
+                treatment.length
+            )
+            : 0;
+
+
+    const programCost =
+        treatment.length *
+        1.5;
+
+
+    const roi =
+        programCost > 0
+            ? (
+                (
+                    incrementalRevenue -
+                    programCost
+                ) /
+                programCost
+            ) * 100
+            : 0;
+
+
+    return {
+
+        totalSessions,
+
+        abandonedCarts:
+            abandonedSessions,
+
+        recoveredCarts:
+            recoveredSessions,
+
+        recoveryRate:
+            abandonedSessions > 0
+                ? (
+                    recoveredSessions /
+                    abandonedSessions
+                ) * 100
+                : 0,
+
+        treatmentRate,
+
+        controlRate,
+
+        incrementalRevenue,
+
+        averageDiscount,
+
+        roi,
+
+        interventions:
+            treatment.length +
+            control.length
+    };
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| CHANNEL STATISTICS
+|--------------------------------------------------------------------------
+*/
+
+async function getChannelStats() {
+
+    const stats =
+        await prisma.channelStats.findMany({
+
+            orderBy: {
+                channel: "asc"
+            }
+        });
+
+
+    return stats.map(
+        item => ({
+
+            channel:
+                item.channel,
+
+            alpha:
+                item.alpha,
+
+            beta:
+                item.beta,
+
+            attempts:
+                item.attempts,
+
+            conversions:
+                item.conversions,
+
+            revenue:
+                item.revenue,
+
+            estimatedConversionRate:
+
+                Number(
+                    (
+                        item.alpha /
+                        (
+                            item.alpha +
+                            item.beta
+                        )
+                    ).toFixed(4)
+                )
+        })
+    );
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| EXPERIMENT ANALYTICS
+|--------------------------------------------------------------------------
+|
+| Treatment vs Control experiment.
+|
+| Incremental revenue is calculated using:
+|
+| Expected control revenue =
+| treatment users × control revenue per user
+|
+| Incremental revenue =
+| treatment revenue - expected control revenue
+|
+|--------------------------------------------------------------------------
+*/
+
+async function getExperimentAnalytics() {
+
+    /*
+    |--------------------------------------------------------------------------
+    | Load treatment and control groups
+    |--------------------------------------------------------------------------
+    */
+
+    const treatment =
+        await prisma.intervention.findMany({
+
+            where: {
+                isControlGroup: false
+            }
+        });
+
+
+    const control =
+        await prisma.intervention.findMany({
+
+            where: {
+                isControlGroup: true
+            }
+        });
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | Count conversions
+    |--------------------------------------------------------------------------
+    */
+
+    const treatmentConversions =
+        treatment.filter(
+            item =>
+                item.status ===
+                "converted"
+        );
+
+
+    const controlConversions =
+        control.filter(
+            item =>
+                item.status ===
+                "converted"
+        );
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | Revenue
+    |--------------------------------------------------------------------------
+    */
+
+    const treatmentRevenue =
+        treatment.reduce(
+
+            (
+                total,
+                item
+            ) =>
+                total +
+                Number(
+                    item.convertedValue ||
+                    0
+                ),
+
+            0
+        );
+
+
+    const controlRevenue =
+        control.reduce(
+
+            (
+                total,
+                item
+            ) =>
+                total +
+                Number(
+                    item.convertedValue ||
+                    0
+                ),
+
+            0
         );
 
 
@@ -723,321 +960,70 @@ async function getMetrics() {
 
     /*
     |--------------------------------------------------------------------------
-    | Revenue
+    | Absolute lift
     |--------------------------------------------------------------------------
     */
-
-    const treatmentRevenue =
-        treatment.reduce(
-
-            (sum, item) =>
-                sum +
-                Number(
-                    item.convertedValue ||
-                    0
-                ),
-
-            0
-        );
-
-
-    const controlRevenue =
-        control.reduce(
-
-            (sum, item) =>
-                sum +
-                Number(
-                    item.convertedValue ||
-                    0
-                ),
-
-            0
-        );
-
-
-    const totalRevenue =
-        treatmentRevenue +
-        controlRevenue;
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Incremental lift
-    |--------------------------------------------------------------------------
-    */
-
-    const incrementalRate =
-        Math.max(
-            0,
-            treatmentRate -
-            controlRate
-        );
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Incremental revenue
-    |--------------------------------------------------------------------------
-    */
-
-    const incrementalRevenue =
-        treatmentRevenue *
-        (
-            incrementalRate /
-            100
-        );
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Average discount
-    |--------------------------------------------------------------------------
-    */
-
-    const averageDiscount =
-        treatment.length > 0
-
-            ? treatment.reduce(
-
-                (sum, item) =>
-                    sum +
-                    Number(
-                        item.discountDepth ||
-                        0
-                    ),
-
-                0
-
-            ) / treatment.length
-
-            : 0;
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Program cost
-    |--------------------------------------------------------------------------
-    |
-    | Simple estimated intervention cost.
-    |--------------------------------------------------------------------------
-    */
-
-    const programCost =
-        treatment.length *
-        1.5;
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | ROI
-    |--------------------------------------------------------------------------
-    */
-
-    const roi =
-        programCost > 0
-
-            ? (
-                (
-                    treatmentRevenue -
-                    programCost
-                ) /
-                programCost
-            ) * 100
-
-            : 0;
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Final metrics
-    |--------------------------------------------------------------------------
-    */
-
-    return {
-
-        totalSessions,
-
-        abandonedCarts:
-            abandonedSessions,
-
-        recoveredCarts:
-            recoveredSessions,
-
-        recoveryRate:
-
-            abandonedSessions > 0
-
-                ? (
-                    recoveredSessions /
-                    abandonedSessions
-                ) * 100
-
-                : 0,
-
-        treatmentRate,
-
-        controlRate,
-
-        treatmentRevenue,
-
-        controlRevenue,
-
-        totalRevenue,
-
-        incrementalRate,
-
-        incrementalRevenue,
-
-        averageDiscount,
-
-        programCost,
-
-        roi,
-
-        interventions:
-            interventions.length,
-
-        treatmentInterventions:
-            treatment.length,
-
-        controlInterventions:
-            control.length,
-
-        treatmentConversions:
-            treatmentConversions.length,
-
-        controlConversions:
-            controlConversions.length
-    };
-}
-
-
-/*
-|--------------------------------------------------------------------------
-| CHANNEL STATISTICS
-|--------------------------------------------------------------------------
-*/
-
-async function getChannelStats() {
-
-    const {
-        getChannelStats:
-            getThompsonChannelStats
-    } = require(
-        "../engines/thompsonSampling"
-    );
-
-
-    return await getThompsonChannelStats();
-}
-
-
-/*
-|--------------------------------------------------------------------------
-| EXPERIMENT ANALYTICS
-|--------------------------------------------------------------------------
-*/
-
-async function getExperimentStats() {
-
-    const interventions =
-        await prisma.intervention.findMany();
-
-
-    const treatment =
-        interventions.filter(
-            (item) =>
-                !item.isControlGroup
-        );
-
-
-    const control =
-        interventions.filter(
-            (item) =>
-                item.isControlGroup
-        );
-
-
-    const treatmentConversions =
-        treatment.filter(
-            (item) =>
-                item.status ===
-                "converted"
-        );
-
-
-    const controlConversions =
-        control.filter(
-            (item) =>
-                item.status ===
-                "converted"
-        );
-
-
-    const treatmentRate =
-        treatment.length > 0
-
-            ? (
-                treatmentConversions.length /
-                treatment.length
-            ) * 100
-
-            : 0;
-
-
-    const controlRate =
-        control.length > 0
-
-            ? (
-                controlConversions.length /
-                control.length
-            ) * 100
-
-            : 0;
-
-
-    const treatmentRevenue =
-        treatment.reduce(
-
-            (sum, item) =>
-                sum +
-                Number(
-                    item.convertedValue ||
-                    0
-                ),
-
-            0
-        );
-
-
-    const controlRevenue =
-        control.reduce(
-
-            (sum, item) =>
-                sum +
-                Number(
-                    item.convertedValue ||
-                    0
-                ),
-
-            0
-        );
-
 
     const absoluteLift =
         treatmentRate -
         controlRate;
 
 
-    const relativeLift =
-        controlRate > 0
+    /*
+    |--------------------------------------------------------------------------
+    | Relative lift
+    |--------------------------------------------------------------------------
+    */
 
-            ? (
+    let relativeLift =
+        null;
+
+
+    if (
+        controlRate > 0
+    ) {
+
+        relativeLift =
+            (
                 absoluteLift /
                 controlRate
-            ) * 100
+            ) * 100;
+    }
 
-            : null;
+
+    /*
+    |--------------------------------------------------------------------------
+    | Revenue per user
+    |--------------------------------------------------------------------------
+    */
+
+    const treatmentRevenuePerUser =
+        treatment.length > 0
+            ? treatmentRevenue /
+              treatment.length
+            : 0;
+
+
+    const controlRevenuePerUser =
+        control.length > 0
+            ? controlRevenue /
+              control.length
+            : 0;
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | Expected control revenue
+    |--------------------------------------------------------------------------
+    |
+    | If the treatment group had performed like the control group,
+    | this is the approximate revenue we would expect.
+    |
+    */
+
+    const expectedControlRevenue =
+        treatment.length *
+        controlRevenuePerUser;
 
 
     /*
@@ -1047,46 +1033,60 @@ async function getExperimentStats() {
     */
 
     const incrementalRevenue =
-        treatmentRevenue *
-        (
-            Math.max(
-                0,
-                absoluteLift
-            ) /
-            100
-        );
+        treatmentRevenue -
+        expectedControlRevenue;
 
 
     /*
     |--------------------------------------------------------------------------
-    | Program cost
+    | Experiment cost
     |--------------------------------------------------------------------------
+    |
+    | Demo assumption:
+    | ₹1.50 per treatment intervention.
+    |
     */
+
+    const costPerTreatment =
+        1.5;
+
 
     const programCost =
         treatment.length *
-        1.5;
+        costPerTreatment;
 
 
     /*
     |--------------------------------------------------------------------------
     | ROI
     |--------------------------------------------------------------------------
+    |
+    | ROI =
+    |
+    | (Incremental Revenue - Cost)
+    | --------------------------- × 100
+    |          Cost
+    |
+    |--------------------------------------------------------------------------
     */
 
     const roi =
         programCost > 0
-
             ? (
                 (
-                    treatmentRevenue -
+                    incrementalRevenue -
                     programCost
                 ) /
                 programCost
             ) * 100
-
             : 0;
 
+
+    /*
+    |--------------------------------------------------------------------------
+    | Clean result
+    |--------------------------------------------------------------------------
+    */
 
     return {
 
@@ -1104,7 +1104,14 @@ async function getExperimentStats() {
                 ),
 
             revenue:
-                treatmentRevenue
+                Number(
+                    treatmentRevenue.toFixed(2)
+                ),
+
+            revenuePerUser:
+                Number(
+                    treatmentRevenuePerUser.toFixed(2)
+                )
         },
 
 
@@ -1122,7 +1129,14 @@ async function getExperimentStats() {
                 ),
 
             revenue:
-                controlRevenue
+                Number(
+                    controlRevenue.toFixed(2)
+                ),
+
+            revenuePerUser:
+                Number(
+                    controlRevenuePerUser.toFixed(2)
+                )
         },
 
 
@@ -1142,9 +1156,28 @@ async function getExperimentStats() {
         },
 
 
-        incrementalRevenue,
+        expectedControlRevenue:
+            Number(
+                expectedControlRevenue.toFixed(2)
+            ),
 
-        roi
+
+        incrementalRevenue:
+            Number(
+                incrementalRevenue.toFixed(2)
+            ),
+
+
+        programCost:
+            Number(
+                programCost.toFixed(2)
+            ),
+
+
+        roi:
+            Number(
+                roi.toFixed(2)
+            )
     };
 }
 
@@ -1158,7 +1191,9 @@ async function getExperimentStats() {
 module.exports = {
 
     /*
+    |--------------------------------------------------------------------------
     | Session
+    |--------------------------------------------------------------------------
     */
 
     createSession,
@@ -1167,7 +1202,9 @@ module.exports = {
 
 
     /*
+    |--------------------------------------------------------------------------
     | Cart
+    |--------------------------------------------------------------------------
     */
 
     createCart,
@@ -1176,7 +1213,9 @@ module.exports = {
 
 
     /*
+    |--------------------------------------------------------------------------
     | Abandonment
+    |--------------------------------------------------------------------------
     */
 
     createContext,
@@ -1184,24 +1223,31 @@ module.exports = {
 
 
     /*
+    |--------------------------------------------------------------------------
     | Intervention
+    |--------------------------------------------------------------------------
     */
 
     createIntervention,
     getIntervention,
+    getLatestIntervention,
     updateIntervention,
     getCustomerInterventions,
 
 
     /*
+    |--------------------------------------------------------------------------
     | Conversion
+    |--------------------------------------------------------------------------
     */
 
     recordConversion,
 
 
     /*
+    |--------------------------------------------------------------------------
     | Audit
+    |--------------------------------------------------------------------------
     */
 
     addAudit,
@@ -1209,10 +1255,12 @@ module.exports = {
 
 
     /*
+    |--------------------------------------------------------------------------
     | Analytics
+    |--------------------------------------------------------------------------
     */
 
     getMetrics,
     getChannelStats,
-    getExperimentStats
+    getExperimentAnalytics
 };

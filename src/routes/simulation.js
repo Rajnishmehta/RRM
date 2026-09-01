@@ -2,57 +2,26 @@ const express = require("express");
 
 const router = express.Router();
 
-
-// ============================================================
-// SERVICES
-// ============================================================
-
 const {
     getSession,
-    getCart,
-    getIntervention,
     getLatestIntervention,
     recordConversion,
-    updateSession,
     addAudit
 } = require("../services/analyticsService");
 
-
-// ============================================================
-// THOMPSON SAMPLING
-// ============================================================
-
 const {
-    updateChannelReward
+    updateChannelStats
 } = require("../engines/thompsonSampling");
 
 
-// ============================================================
-// POST /api/simulation/convert
-// ============================================================
-//
-// Development/testing endpoint.
-//
-// Simulates a customer completing checkout after receiving
-// a recovery intervention.
-//
-// Flow:
-//
-// Session
-//   ↓
-// Intervention
-//   ↓
-// Conversion
-//   ↓
-// Revenue
-//   ↓
-// Session recovered
-//   ↓
-// Thompson Sampling learns
-//   ↓
-// Audit log
-//
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| POST /api/simulation/convert
+|--------------------------------------------------------------------------
+|
+| Simulates a customer conversion after a recovery intervention.
+|
+*/
 
 router.post("/convert", async (req, res) => {
 
@@ -60,14 +29,15 @@ router.post("/convert", async (req, res) => {
 
         const {
             sessionId,
-            interventionId,
             conversionValue
         } = req.body;
 
 
-        // ====================================================
-        // VALIDATION
-        // ====================================================
+        /*
+        |--------------------------------------------------------------------------
+        | Validate request
+        |--------------------------------------------------------------------------
+        */
 
         if (!sessionId) {
 
@@ -77,36 +47,33 @@ router.post("/convert", async (req, res) => {
 
                 message:
                     "sessionId is required"
-
             });
-
         }
 
 
         const value =
-            Number(conversionValue);
+            Number(
+                conversionValue || 0
+            );
 
 
-        if (
-            !Number.isFinite(value) ||
-            value <= 0
-        ) {
+        if (value <= 0) {
 
             return res.status(400).json({
 
                 success: false,
 
                 message:
-                    "conversionValue must be a positive number"
-
+                    "conversionValue must be greater than 0"
             });
-
         }
 
 
-        // ====================================================
-        // GET SESSION
-        // ====================================================
+        /*
+        |--------------------------------------------------------------------------
+        | Find session
+        |--------------------------------------------------------------------------
+        */
 
         const session =
             await getSession(
@@ -122,280 +89,250 @@ router.post("/convert", async (req, res) => {
 
                 message:
                     "Session not found"
-
             });
-
         }
 
 
-        // ====================================================
-        // GET CART
-        // ====================================================
+        /*
+        |--------------------------------------------------------------------------
+        | Find latest intervention
+        |--------------------------------------------------------------------------
+        */
 
-        const cart =
-            await getCart(
+        const intervention =
+            await getLatestIntervention(
                 sessionId
             );
 
 
-        if (!cart) {
+        if (!intervention) {
 
             return res.status(404).json({
 
                 success: false,
 
                 message:
-                    "Cart not found"
-
+                    "No intervention found for session"
             });
-
         }
 
 
-        // ====================================================
-        // GET INTERVENTION
-        // ====================================================
-
-        let intervention;
-
-
-        if (interventionId) {
-
-            intervention =
-                await getIntervention(
-                    interventionId
-                );
-
-        }
-
-        else {
-
-            intervention =
-                await getLatestIntervention(
-                    sessionId
-                );
-
-        }
-
-
-        if (!intervention) {
-
-            return res.status(400).json({
-
-                success: false,
-
-                message:
-                    "No recovery intervention found for this session"
-
-            });
-
-        }
-
-
-        // ====================================================
-        // VERIFY INTERVENTION BELONGS TO SESSION
-        // ====================================================
-
-        if (
-            intervention.sessionId !==
-            sessionId
-        ) {
-
-            return res.status(400).json({
-
-                success: false,
-
-                message:
-                    "Intervention does not belong to this session"
-
-            });
-
-        }
-
-
-        // ====================================================
-        // CONTROL GROUP
-        // ====================================================
-        //
-        // Control users should normally not have a treatment
-        // intervention. However, if a control intervention is
-        // somehow supplied, we still record the conversion but
-        // do NOT give Thompson Sampling a treatment reward.
-        //
-        // This keeps the experiment statistically cleaner.
-        // ====================================================
-
-        const isControlGroup =
-            Boolean(
-                intervention.isControlGroup
-            );
-
-
-        // ====================================================
-        // PREVENT DUPLICATE CONVERSION
-        // ====================================================
+        /*
+        |--------------------------------------------------------------------------
+        | Prevent duplicate conversion
+        |--------------------------------------------------------------------------
+        */
 
         if (
             intervention.status ===
             "converted"
         ) {
 
-            return res.status(409).json({
+            return res.status(400).json({
 
                 success: false,
 
                 message:
-                    "This intervention has already been converted",
+                    "Intervention has already been converted",
 
                 interventionId:
-                    intervention.interventionId,
-
-                previousConversionValue:
-                    intervention.convertedValue
-
+                    intervention.interventionId
             });
-
         }
 
 
-        // ====================================================
-        // RECORD CONVERSION
-        // ====================================================
-        //
-        // Updates:
-        //
-        // Intervention.status
-        // Intervention.convertedValue
-        //
-        // ====================================================
+        /*
+        |--------------------------------------------------------------------------
+        | Record conversion
+        |--------------------------------------------------------------------------
+        */
 
-        const updatedIntervention =
-            await recordConversion({
-
-                interventionId:
-                    intervention.interventionId,
-
-                convertedValue:
-                    value
-
-            });
-
-
-        // ====================================================
-        // UPDATE SESSION
-        // ====================================================
-        //
-        // Customer successfully completed checkout.
-        //
-        // abandoned → recovered
-        //
-        // ====================================================
-
-        const updatedSession =
-            await updateSession(
-
-                sessionId,
-
-                {
-
-                    status:
-                        "recovered",
-
-                    lastActivity:
-                        new Date()
-
-                }
-
+        const result =
+            await recordConversion(
+                intervention,
+                value
             );
 
 
-        // ====================================================
-        // THOMPSON SAMPLING LEARNING
-        // ====================================================
-        //
-        // IMPORTANT:
-        //
-        // Revenue is passed as the third argument.
-        //
-        // This fixes the previous issue where:
-        //
-        // conversion = 1
-        // revenue = 0
-        //
-        // ====================================================
+        /*
+        |--------------------------------------------------------------------------
+        | Learning
+        |--------------------------------------------------------------------------
+        |
+        | Only treatment interventions should update
+        | Thompson Sampling.
+        |
+        */
 
         let learning = null;
 
 
         if (
-            !isControlGroup &&
+            !intervention.isControlGroup &&
             intervention.channel !== "none"
         ) {
 
-            learning =
-                updateChannelReward(
+            try {
 
-                    intervention.channel,
+                learning =
+                    await updateChannelStats(
+                        intervention.channel,
+                        true,
+                        value
+                    );
 
-                    true,
+            } catch (learningError) {
 
-                    value
-
+                console.error(
+                    "Learning error:",
+                    learningError.message
                 );
 
+                learning = {
+
+                    success: false,
+
+                    error:
+                        learningError.message
+                };
+            }
         }
 
 
-        // ====================================================
-        // AUDIT LOG
-        // ====================================================
+        /*
+        |--------------------------------------------------------------------------
+        | Audit
+        |--------------------------------------------------------------------------
+        */
 
         await addAudit(
 
-            "CHECKOUT_CONVERTED",
+            "conversion_recorded",
 
             {
 
                 sessionId,
 
-                customerId:
-                    session.customerId,
-
                 interventionId:
                     intervention.interventionId,
+
+                customerId:
+                    intervention.customerId,
 
                 channel:
                     intervention.channel,
 
-                offerType:
-                    intervention.offerType,
-
-                discountDepth:
-                    intervention.discountDepth,
-
                 conversionValue:
                     value,
 
-                recoveredRevenue:
-                    value,
-
                 controlGroup:
-                    isControlGroup,
-
-                learning
+                    intervention.isControlGroup
 
             },
 
             true
-
         );
 
 
-        // ====================================================
-        // RESPONSE
-        // ====================================================
+        /*
+        |--------------------------------------------------------------------------
+        | Clean response objects
+        |--------------------------------------------------------------------------
+        */
 
-        return res.status(200).json({
+        const interventionResponse = {
+
+            interventionId:
+                result.intervention.interventionId,
+
+            sessionId:
+                result.intervention.sessionId,
+
+            customerId:
+                result.intervention.customerId,
+
+            channel:
+                result.intervention.channel,
+
+            offerType:
+                result.intervention.offerType,
+
+            discountDepth:
+                result.intervention.discountDepth,
+
+            status:
+                result.intervention.status,
+
+            convertedValue:
+                result.intervention.convertedValue,
+
+            isControlGroup:
+                result.intervention.isControlGroup,
+
+            sentAt:
+                result.intervention.sentAt
+        };
+
+
+        const learningResponse =
+            learning
+                ? {
+
+                    channel:
+                        intervention.channel,
+
+                    conversion:
+                        true,
+
+                    reward:
+                        1,
+
+                    success:
+                        learning.success !== false,
+
+                    alpha:
+                        learning.alpha,
+
+                    beta:
+                        learning.beta,
+
+                    attempts:
+                        learning.attempts,
+
+                    conversions:
+                        learning.conversions,
+
+                    revenue:
+                        learning.revenue,
+
+                    estimatedConversionRate:
+                        learning.estimatedConversionRate
+
+                }
+                : {
+
+                    channel:
+                        intervention.channel,
+
+                    conversion:
+                        true,
+
+                    reward:
+                        1,
+
+                    skipped:
+                        intervention.isControlGroup
+
+                };
+
+
+        /*
+        |--------------------------------------------------------------------------
+        | Final response
+        |--------------------------------------------------------------------------
+        */
+
+        return res.json({
 
             success: true,
 
@@ -404,52 +341,37 @@ router.post("/convert", async (req, res) => {
 
             sessionId,
 
-            interventionId:
-                updatedIntervention
-                    .interventionId,
-
             customerId:
-                session.customerId,
+                intervention.customerId,
 
             conversionValue:
                 value,
 
             recoveredRevenue:
-                value,
+                result.recoveredRevenue,
 
             controlGroup:
-                isControlGroup,
+                intervention.isControlGroup,
 
             channel:
                 intervention.channel,
 
             sessionStatus:
-                updatedSession.status,
+                result.session.status,
 
-            intervention: {
+            intervention:
+                interventionResponse,
 
-                status:
-                    updatedIntervention.status,
-
-                convertedValue:
-                    updatedIntervention
-                        .convertedValue
-
-            },
-
-            learning
-
+            learning:
+                learningResponse
         });
 
 
     } catch (error) {
 
         console.error(
-
-            "Conversion simulation error:",
-
+            "Conversion error:",
             error
-
         );
 
 
@@ -462,109 +384,9 @@ router.post("/convert", async (req, res) => {
 
             error:
                 error.message
-
         });
-
     }
-
 });
 
-
-// ============================================================
-// GET /api/simulation/status/:sessionId
-// ============================================================
-//
-// Useful development endpoint to inspect the complete state
-// of a test session.
-// ============================================================
-
-router.get(
-    "/status/:sessionId",
-    async (req, res) => {
-
-        try {
-
-            const {
-                sessionId
-            } = req.params;
-
-
-            const session =
-                await getSession(
-                    sessionId
-                );
-
-
-            if (!session) {
-
-                return res.status(404).json({
-
-                    success: false,
-
-                    message:
-                        "Session not found"
-
-                });
-
-            }
-
-
-            const cart =
-                await getCart(
-                    sessionId
-                );
-
-
-            const intervention =
-                await getLatestIntervention(
-                    sessionId
-                );
-
-
-            return res.json({
-
-                success: true,
-
-                session,
-
-                cart,
-
-                intervention
-
-            });
-
-
-        } catch (error) {
-
-            console.error(
-
-                "Simulation status error:",
-
-                error
-
-            );
-
-
-            return res.status(500).json({
-
-                success: false,
-
-                message:
-                    "Failed to get simulation status",
-
-                error:
-                    error.message
-
-            });
-
-        }
-
-    }
-);
-
-
-// ============================================================
-// EXPORT
-// ============================================================
 
 module.exports = router;

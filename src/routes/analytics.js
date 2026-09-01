@@ -9,7 +9,8 @@ const router = express.Router();
 
 const {
     getMetrics,
-    getAuditLogs
+    getAuditLogs,
+    getExperimentAnalytics
 } = require("../services/analyticsService");
 
 
@@ -172,140 +173,64 @@ router.get(
 
 
 // ============================================================
-// EXPORT
-// ============================================================
-// ============================================================
 // GET /api/analytics/experiment
 // ============================================================
+//
+// IMPORTANT:
+//
+// Experiment calculations are handled by
+// getExperimentAnalytics() inside analyticsService.
+//
+// Do NOT calculate experiment values from getMetrics() here.
+//
+// ============================================================
 
-router.get("/experiment", async (req, res) => {
+router.get(
+    "/experiment",
+    async (req, res) => {
 
-    try {
+        try {
 
-        const metrics = await getMetrics();
-
-        const treatmentUsers =
-            metrics.treatmentInterventions || 0;
-
-        const controlUsers =
-            metrics.controlInterventions || 0;
-
-        const treatmentConversions =
-            metrics.treatmentConversions || 0;
-
-        const controlConversions =
-            metrics.controlConversions || 0;
-
-        const treatmentRate =
-            treatmentUsers > 0
-                ? (treatmentConversions / treatmentUsers) * 100
-                : 0;
-
-        const controlRate =
-            controlUsers > 0
-                ? (controlConversions / controlUsers) * 100
-                : 0;
-
-        const absoluteLift =
-            treatmentRate - controlRate;
-
-        const relativeLift =
-            controlRate > 0
-                ? (
-                    (treatmentRate - controlRate) /
-                    controlRate
-                ) * 100
-                : null;
+            const experiment =
+                await getExperimentAnalytics();
 
 
-        return res.json({
+            return res.json({
 
-            success: true,
+                success: true,
 
-            experiment: {
+                experiment
 
-                treatment: {
+            });
 
-                    users:
-                        treatmentUsers,
+        } catch (error) {
 
-                    conversions:
-                        treatmentConversions,
+            console.error(
+                "Experiment analytics error:",
+                error
+            );
 
-                    conversionRate:
-                        Number(
-                            treatmentRate.toFixed(2)
-                        ),
 
-                    revenue:
-                        metrics.treatmentRevenue || 0
+            return res.status(500).json({
 
-                },
+                success: false,
 
-                control: {
+                message:
+                    "Failed to get experiment analytics",
 
-                    users:
-                        controlUsers,
+                error:
+                    error.message
 
-                    conversions:
-                        controlConversions,
+            });
 
-                    conversionRate:
-                        Number(
-                            controlRate.toFixed(2)
-                        ),
-
-                    revenue:
-                        metrics.controlRevenue || 0
-
-                },
-
-                lift: {
-
-                    absolutePercentagePoints:
-                        Number(
-                            absoluteLift.toFixed(2)
-                        ),
-
-                    relativePercentage:
-                        relativeLift === null
-                            ? null
-                            : Number(
-                                relativeLift.toFixed(2)
-                            )
-
-                },
-
-                incrementalRevenue:
-                    metrics.incrementalRevenue || 0,
-
-                roi:
-                    metrics.roi || 0
-
-            }
-
-        });
-
-    } catch (error) {
-
-        console.error(
-            "Experiment analytics error:",
-            error
-        );
-
-        return res.status(500).json({
-
-            success: false,
-
-            message:
-                "Failed to get experiment analytics",
-
-            error:
-                error.message
-
-        });
+        }
 
     }
+);
 
-});
+
+// ============================================================
+// EXPORT
+// ============================================================
+
 module.exports = router;

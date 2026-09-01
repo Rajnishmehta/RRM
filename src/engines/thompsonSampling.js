@@ -14,6 +14,7 @@ const { prisma } = require("../config/prisma");
 // in_app
 //
 // Beta distribution:
+//
 // alpha = successful outcomes + prior
 // beta  = unsuccessful outcomes + prior
 //
@@ -51,7 +52,6 @@ function randomNormal() {
     Math.cos(
         2 * Math.PI * v
     );
-
 }
 
 
@@ -73,7 +73,6 @@ function sampleGamma(shape) {
             u,
             1 / shape
         );
-
     }
 
 
@@ -116,7 +115,6 @@ function sampleGamma(shape) {
         ) {
 
             return d * v3;
-
         }
 
 
@@ -132,11 +130,8 @@ function sampleGamma(shape) {
         ) {
 
             return d * v3;
-
         }
-
     }
-
 }
 
 
@@ -157,7 +152,6 @@ function sampleBeta(
 
 
     return x / (x + y);
-
 }
 
 
@@ -193,13 +187,9 @@ async function initializeChannels() {
                 conversions: 0,
 
                 revenue: 0
-
             }
-
         });
-
     }
-
 }
 
 
@@ -207,9 +197,12 @@ async function initializeChannels() {
 // CHOOSE CHANNEL
 // ============================================================
 //
-// IMPORTANT:
-// This function is now asynchronous because statistics come
-// from PostgreSQL.
+// Thompson Sampling:
+//
+// 1. Load channel statistics
+// 2. Sample from each Beta distribution
+// 3. Select highest sample
+// 4. Increment attempts
 //
 // ============================================================
 
@@ -226,9 +219,7 @@ async function chooseChannel() {
                 channel: {
                     in: CHANNELS
                 }
-
             }
-
         });
 
 
@@ -250,7 +241,6 @@ async function chooseChannel() {
                 Number(item.alpha),
 
                 Number(item.beta)
-
             );
 
 
@@ -264,9 +254,7 @@ async function chooseChannel() {
 
             bestChannel =
                 item.channel;
-
         }
-
     }
 
 
@@ -275,11 +263,14 @@ async function chooseChannel() {
         throw new Error(
             "No recovery channel available"
         );
-
     }
 
 
-    // Record attempt
+    /*
+    |--------------------------------------------------------------------------
+    | Record attempt
+    |--------------------------------------------------------------------------
+    */
 
     await prisma.channelStats.update({
 
@@ -287,7 +278,6 @@ async function chooseChannel() {
 
             channel:
                 bestChannel
-
         },
 
         data: {
@@ -295,21 +285,32 @@ async function chooseChannel() {
             attempts: {
 
                 increment: 1
-
             }
-
         }
-
     });
 
 
     return bestChannel;
-
 }
 
 
 // ============================================================
 // UPDATE CHANNEL REWARD
+// ============================================================
+//
+// Called after customer outcome.
+//
+// conversion = true
+//      alpha + 1
+//      conversions + 1
+//      revenue += conversion revenue
+//
+// conversion = false
+//      beta + 1
+//
+// attempts are NOT incremented here because attempts
+// are already recorded by chooseChannel().
+//
 // ============================================================
 
 async function updateChannelReward(
@@ -325,7 +326,6 @@ async function updateChannelReward(
         throw new Error(
             `Invalid recovery channel: ${channel}`
         );
-
     }
 
 
@@ -337,22 +337,32 @@ async function updateChannelReward(
         Number(revenue) || 0;
 
 
+    /*
+    |--------------------------------------------------------------------------
+    | Make sure channel exists
+    |--------------------------------------------------------------------------
+    */
+
     const current =
         await prisma.channelStats.findUnique({
 
             where: {
                 channel
             }
-
         });
 
 
     if (!current) {
 
         await initializeChannels();
-
     }
 
+
+    /*
+    |--------------------------------------------------------------------------
+    | Update Bayesian statistics
+    |--------------------------------------------------------------------------
+    */
 
     const updated =
         await prisma.channelStats.update({
@@ -360,7 +370,6 @@ async function updateChannelReward(
             where: {
 
                 channel
-
             },
 
             data: {
@@ -392,13 +401,19 @@ async function updateChannelReward(
                             increment: value
                         }
                         : undefined
-
             }
-
         });
 
 
+    /*
+    |--------------------------------------------------------------------------
+    | Return clean learning result
+    |--------------------------------------------------------------------------
+    */
+
     return {
+
+        success: true,
 
         channel,
 
@@ -406,7 +421,9 @@ async function updateChannelReward(
             converted,
 
         reward:
-            converted ? 1 : 0,
+            converted
+                ? 1
+                : 0,
 
         alpha:
             updated.alpha,
@@ -427,20 +444,39 @@ async function updateChannelReward(
             Number(
 
                 (
-
                     updated.alpha /
-
                     (
                         updated.alpha +
                         updated.beta
                     )
-
                 ).toFixed(4)
-
             )
-
     };
+}
 
+
+// ============================================================
+// UPDATE CHANNEL STATS
+// ============================================================
+//
+// Public function used by simulation.js.
+//
+// This wraps updateChannelReward() so the route has a
+// descriptive API for learning updates.
+//
+// ============================================================
+
+async function updateChannelStats(
+    channel,
+    conversion,
+    revenue = 0
+) {
+
+    return await updateChannelReward(
+        channel,
+        conversion,
+        revenue
+    );
 }
 
 
@@ -460,50 +496,44 @@ async function getChannelStats() {
 
                 channel:
                     "asc"
-
             }
-
         });
 
 
-    return stats.map(item => ({
+    return stats.map(
+        item => ({
 
-        channel:
-            item.channel,
+            channel:
+                item.channel,
 
-        alpha:
-            item.alpha,
+            alpha:
+                item.alpha,
 
-        beta:
-            item.beta,
+            beta:
+                item.beta,
 
-        attempts:
-            item.attempts,
+            attempts:
+                item.attempts,
 
-        conversions:
-            item.conversions,
+            conversions:
+                item.conversions,
 
-        revenue:
-            item.revenue,
+            revenue:
+                item.revenue,
 
-        estimatedConversionRate:
-            Number(
-
-                (
-
-                    item.alpha /
+            estimatedConversionRate:
+                Number(
 
                     (
-                        item.alpha +
-                        item.beta
-                    )
-
-                ).toFixed(4)
-
-            )
-
-    }));
-
+                        item.alpha /
+                        (
+                            item.alpha +
+                            item.beta
+                        )
+                    ).toFixed(4)
+                )
+        })
+    );
 }
 
 
@@ -512,6 +542,7 @@ async function getChannelStats() {
 // ============================================================
 //
 // Development/testing only.
+//
 // ============================================================
 
 async function resetChannelStats() {
@@ -532,14 +563,11 @@ async function resetChannelStats() {
             conversions: 0,
 
             revenue: 0
-
         }
-
     });
 
 
     return await getChannelStats();
-
 }
 
 
@@ -553,8 +581,9 @@ module.exports = {
 
     updateChannelReward,
 
+    updateChannelStats,
+
     getChannelStats,
 
     resetChannelStats
-
 };
